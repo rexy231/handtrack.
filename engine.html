@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#020a12;overflow:hidden;font-family:monospace;color:#9ff}
+video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover;transform:scaleX(-1);opacity:.4}
+canvas{position:fixed;inset:0;width:100vw;height:100vh}
+#ov{pointer-events:none}
+#scan{position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,255,255,.05) 0 1px,transparent 1px 4px),radial-gradient(ellipse at center,transparent 50%,rgba(0,0,0,.7))}
+#top{position:fixed;top:10px;left:0;right:0;text-align:center;font-size:20px;letter-spacing:4px;text-shadow:0 0 10px #0ff;pointer-events:none}
+#info{position:fixed;top:44px;left:0;right:0;text-align:center;font-size:16px;color:#fff;white-space:pre;pointer-events:none;text-shadow:0 0 8px #0ff}
+#help{position:fixed;left:14px;bottom:82px;font-size:13px;line-height:1.6;pointer-events:none;text-shadow:0 0 6px #000}
+#bar{position:fixed;left:0;right:0;bottom:14px;display:flex;justify-content:center;gap:10px;flex-wrap:wrap}
+#bar button{padding:12px 16px;font:bold 17px monospace;color:#fff;background:rgba(0,255,255,.15);border:2px solid #0ff;border-radius:26px}
+#bar button.on{background:#0ff;color:#012}
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<canvas id="gl"></canvas>
+<canvas id="ov"></canvas>
+<div id="scan"></div>
+<div id="top">ENGINE LAB // HAND CONTROL</div>
+<div id="info">Loading... (10-15 sec)</div>
+<div id="help">🤏 Pinch+drag = ghumao<br>✋ Palm = throttle full | ✊ Fist = idle<br>🤏🤏 Dono haath phailao = parts alag<br>✌️ Peace = parts jodo</div>
+<div id="bar"></div>
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import {HandLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const v = $('v'), ov = $('ov'), ox = ov.getContext('2d'), infoEl = $('info');
+let W = innerWidth, H = innerHeight;
+
+// ---------- three setup ----------
+const renderer = new THREE.WebGLRenderer({canvas: $('gl'), alpha: true, antialias: true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+const scene = new THREE.Scene();
+const cam = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
+cam.position.set(0, 0.5, 11);
+scene.add(new THREE.AmbientLight(0x6688aa, 0.9));
+const dl = new THREE.DirectionalLight(0xffffff, 1.6); dl.position.set(5, 8, 6); scene.add(dl);
+const pl = new THREE.PointLight(0x00ffff, 60, 30); pl.position.set(-5, 2, 5); scene.add(pl);
+function resize(){
+  W = innerWidth; H = innerHeight;
+  renderer.setSize(W, H); cam.aspect = W / H; cam.updateProjectionMatrix();
+  ov.width = W; ov.height = H;
+}
+addEventListener('resize', resize); resize();
+
+// ---------- helpers ----------
+const M = (c, o = {}) => new THREE.MeshStandardMaterial(Object.assign({color: c, metalness: .7, roughness: .35}, o));
+const GL = (c, o = {}) => new THREE.MeshBasicMaterial(Object.assign({color: c, transparent: true, opacity: .35, blending: THREE.AdditiveBlending, depthWrite: false}, o));
+const mesh = (g, m) => new THREE.Mesh(g, m);
+const part = dir => { const g = new THREE.Group(); g.userData.dir = new THREE.Vector3(dir[0], dir[1], dir[2]); return g; };
+const edges = (m, c) => { m.add(new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry), new THREE.LineBasicMaterial({color: c, transparent: true, opacity: .6}))); return m; };
+
+function disc(n, r0, r1, w, col){
+  const g = new THREE.Group();
+  const h = mesh(new THREE.CylinderGeometry(r0, r0, .2, 20), M(col)); h.rotation.z = Math.PI / 2; g.add(h);
+  const bm = M(col, {metalness: .9, roughness: .25}), rm = (r0 + r1) / 2;
+  for(let i = 0; i < n; i++){
+    const a = i / n * Math.PI * 2;
+    const b = mesh(new THREE.BoxGeometry(.06, r1 - r0, w), bm);
+    b.position.set(0, Math.cos(a) * rm, Math.sin(a) * rm);
+    b.rotation.set(a, 0, 0); b.rotateY(.6); g.add(b);
+  }
+  return g;
+}
+function label(txt, col){
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+  const q = c.getContext('2d'); q.font = 'bold 38px monospace'; q.textAlign = 'center';
+  q.fillStyle = '#' + col.toString(16).padStart(6, '0'); q.fillText(txt, 128, 46);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), transparent: true, depthTest: false}));
+  s.scale.set(2.4, .6, 1); return s;
+}
+
+// ---------- 1. CAR ENGINE ----------
+function car(){
+  const g = new THREE.Group(), parts = [];
+  const R = .45, L = 1.5, Zs = [-1.9, -.65, .65, 1.9], ph = [0, Math.PI, Math.PI, 0];
+  const add = p => { g.add(p); parts.push(p); return p; };
+  const blk = add(part([0, 1.2, 0]));
+  const b = edges(mesh(new THREE.BoxGeometry(1.7, 2.3, 5.6), GL(0x00aaff, {opacity: .1})), 0x00ccff);
+  b.position.y = 1.3; blk.add(b);
+  const crank = add(part([0, -1.4, 0]));
+  const shaft = mesh(new THREE.CylinderGeometry(.14, .14, 6.2, 16), M(0xaaaaaa)); shaft.rotation.x = Math.PI / 2; crank.add(shaft);
+  Zs.forEach((z, i) => {
+    const pin = mesh(new THREE.CylinderGeometry(.2, .2, .7, 16), M(0xffaa00)); pin.rotation.x = Math.PI / 2;
+    pin.position.set(R * Math.sin(ph[i]), R * Math.cos(ph[i]), z); crank.add(pin);
+  });
+  const fw = mesh(new THREE.CylinderGeometry(1.1, 1.1, .25, 32), M(0x667788)); fw.rotation.x = Math.PI / 2; fw.position.z = 3.5; crank.add(fw);
+  const notch = mesh(new THREE.BoxGeometry(.3, .3, .3), M(0xff3366)); notch.position.set(0, .95, 3.5); crank.add(notch);
+  const pcs = Zs.map(z => {
+    const w = add(part([0, 1.3, z * .45]));
+    const p = mesh(new THREE.CylinderGeometry(.55, .55, .55, 24), M(0xdddddd)); p.position.z = z;
+    const rod = mesh(new THREE.CylinderGeometry(.07, .07, L, 8), M(0x999999)); rod.position.z = z;
+    w.add(p, rod); return {p, rod};
+  });
+  let th0 = 0;
+  return {g, parts, rot: [.35, -.6, 0], sc: 1,
+    tick(dt, th){
+      th0 += th * 14 * dt + dt * 1.2;
+      crank.rotation.z = -th0;
+      pcs.forEach((o, i) => {
+        const a = th0 + ph[i], s = R * Math.sin(a), c = R * Math.cos(a), py = c + Math.sqrt(L * L - s * s);
+        o.p.position.y = py + .25;
+        const dx = -s, dy = py - c;
+        o.rod.position.set(s + dx / 2, c + dy / 2, Zs[i]);
+        o.rod.rotation.z = -Math.atan2(dx, dy);
+      });
+    },
+    info: th => 'RPM ' + Math.round(800 + th * 6200) + '  |  INLINE-4  |  4-STROKE'};
+}
+
+// ---------- 2. JET ENGINE ----------
+function jet(){
+  const g = new THREE.Group(), parts = [], sp = [];
+  const add = p => { g.add(p); parts.push(p); return p; };
+  const nac = add(part([0, 1.7, 0]));
+  const n = edges(mesh(new THREE.CylinderGeometry(1.7, 1.5, 6.6, 40, 1, true), GL(0x00aaff, {opacity: .1, side: THREE.DoubleSide})), 0x00ccff);
+  n.rotation.z = Math.PI / 2; n.position.x = .3; nac.add(n);
+  const st = (x, cnt, r0, r1, w, dx, col) => { const p = add(part([dx, 0, 0])); const d = disc(cnt, r0, r1, w, col); d.position.x = x; p.add(d); sp.push(d); };
+  st(-2.7, 18, .35, 1.45, .4, -1.8, 0xdddddd);
+  st(-1.5, 16, .3, 1.1, .25, -1.1, 0xbbbbcc);
+  st(-.9, 14, .3, .95, .22, -.6, 0xaaaabb);
+  st(-.3, 12, .3, .8, .2, -.1, 0x9999aa);
+  const cb = add(part([0, -1.6, 0]));
+  const cm = mesh(new THREE.TorusGeometry(.7, .28, 16, 32), GL(0xff6a00, {opacity: .5})); cm.rotation.y = Math.PI / 2; cm.position.x = .7; cb.add(cm);
+  st(1.5, 14, .3, .8, .2, .9, 0x887766);
+  st(2, 12, .3, .7, .2, 1.3, 0x776655);
+  const nz = add(part([1.9, 0, 0]));
+  const nm = edges(mesh(new THREE.CylinderGeometry(1, .65, 1.3, 32, 1, true), M(0x99aabb, {side: THREE.DoubleSide})), 0x00ccff);
+  nm.rotation.z = Math.PI / 2; nm.position.x = 3; nz.add(nm);
+  const fl = add(part([2.6, 0, 0]));
+  const f1 = mesh(new THREE.ConeGeometry(.6, 1, 24), GL(0xff7a1a, {opacity: .5}));
+  const f2 = mesh(new THREE.ConeGeometry(.3, 1, 24), GL(0x9fdfff, {opacity: .7}));
+  f1.rotation.z = f2.rotation.z = -Math.PI / 2; fl.add(f1, f2);
+  return {g, parts, rot: [.2, -.5, 0], sc: 1,
+    tick(dt, th){
+      sp.forEach((d, i) => d.rotation.x += (dt * 2 + th * 20 * dt) * (i % 2 ? -1 : 1));
+      cm.material.opacity = .2 + th * .6;
+      const len = .4 + th * 2.8 + Math.random() * .15;
+      f1.scale.y = len; f1.position.x = 3.65 + len / 2;
+      f2.scale.y = len * .65; f2.position.x = 3.65 + len * .325;
+      f1.material.opacity = .15 + th * .45; f2.material.opacity = .25 + th * .5;
+    },
+    info: th => 'N1 ' + Math.round(22 + th * 78) + '%  |  EGT ' + Math.round(420 + th * 480) + ' C  |  THRUST ' + Math.round(th * 128) + ' kN'};
+}
+
+// ---------- 3. ROCKET ENGINE ----------
+function rocket(){
+  const g = new THREE.Group(), parts = [];
+  const add = p => { g.add(p); parts.push(p); return p; };
+  const bell = add(part([0, -1.5, 0]));
+  const geo = new THREE.LatheGeometry([[.8,1.6],[.8,1],[.5,.5],[.32,.2],[.45,-.3],[.7,-.9],[.95,-1.5],[1.1,-1.9]].map(p => new THREE.Vector2(p[0], p[1])), 40);
+  const wire = mesh(geo, GL(0x00ffff, {wireframe: true, opacity: .3})); wire.scale.set(1.02, 1, 1.02);
+  bell.add(mesh(geo, M(0xb87333, {side: THREE.DoubleSide, metalness: .9, roughness: .3})), wire);
+  const ch = add(part([0, .8, 0]));
+  const cm = mesh(new THREE.CylinderGeometry(.55, .55, 1.4, 24), GL(0xff6a00, {opacity: .4})); cm.position.y = 1; ch.add(cm);
+  const tank = add(part([0, 2.2, 0]));
+  const tk = edges(mesh(new THREE.CylinderGeometry(1, 1, 2.2, 32), GL(0x00aaff, {opacity: .15})), 0x00ccff); tk.position.y = 3; tank.add(tk);
+  const pump = add(part([1.8, .5, 0]));
+  const pd = disc(10, .12, .55, .2, 0xcccccc); pd.position.set(1.8, 1.9, 0);
+  const hs = mesh(new THREE.CylinderGeometry(.62, .62, .5, 24), GL(0x00ffff, {opacity: .2})); hs.rotation.z = Math.PI / 2; hs.position.copy(pd.position);
+  pump.add(pd, hs);
+  const fl = add(part([0, -2.4, 0]));
+  const f1 = mesh(new THREE.ConeGeometry(1, 1, 24), GL(0xff6a00, {opacity: .5}));
+  const f2 = mesh(new THREE.ConeGeometry(.5, 1, 24), GL(0xbfe8ff, {opacity: .7}));
+  f1.rotation.x = f2.rotation.x = Math.PI; fl.add(f1, f2);
+  const N = 160, pa = new Float32Array(N * 3);
+  const rst = i => { const a = Math.random() * 6.28, r = Math.random() * .8; pa[i*3] = Math.cos(a) * r; pa[i*3+1] = -1.9 - Math.random() * 2; pa[i*3+2] = Math.sin(a) * r; };
+  for(let i = 0; i < N; i++) rst(i);
+  const pts = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pa, 3)),
+    new THREE.PointsMaterial({color: 0xffaa33, size: .09, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false}));
+  pts.frustumCulled = false; fl.add(pts);
+  return {g, parts, rot: [.1, .5, 0], sc: .8,
+    tick(dt, th){
+      pd.rotation.x += (dt * 2 + th * 25 * dt);
+      cm.material.opacity = .2 + th * .5;
+      const len = .6 + th * 3.2 + Math.random() * .2;
+      f1.scale.y = len; f1.position.y = -1.9 - len / 2;
+      f2.scale.y = len * .7; f2.position.y = -1.9 - len * .35;
+      f1.material.opacity = .15 + th * .45; f2.material.opacity = .25 + th * .5;
+      const lim = -1.9 - (1.2 + th * 3.5);
+      for(let i = 0; i < N; i++){
+        pa[i*3+1] -= (2 + th * 7) * dt;
+        if(pa[i*3+1] < lim){ rst(i); pa[i*3+1] = -1.9; }
+      }
+      pts.geometry.attributes.position.needsUpdate = true;
+    },
+    info: th => 'THRUST ' + Math.round(100 + th * 745) + ' kN  |  CHAMBER ' + Math.round(th * 100) + '%  |  Isp 311 s'};
+}
+
+// ---------- 4. GAME ENGINE ----------
+function game(){
+  const g = new THREE.Group(), parts = [];
+  const names = ['RENDER', 'PHYSICS', 'AUDIO', 'INPUT', 'AI', 'SCRIPT'];
+  const cols = [0xff3366, 0x33ccff, 0xffcc00, 0x66ff99, 0xcc66ff, 0xff9933];
+  const core = edges(mesh(new THREE.IcosahedronGeometry(1.1, 1), M(0x00ffff, {emissive: 0x006688})), 0xffffff); g.add(core);
+  const ring = mesh(new THREE.TorusGeometry(3.6, .03, 8, 80), GL(0x00ffff, {opacity: .4})); g.add(ring);
+  const boxes = [], units = [];
+  names.forEach((nm, i) => {
+    const a = i / 6 * Math.PI * 2, ux = Math.cos(a), uy = Math.sin(a);
+    const w = part([ux * 1.2, uy * 1.2, 0]); g.add(w); parts.push(w);
+    const bx = edges(mesh(new THREE.BoxGeometry(1.3, 1, 1), M(cols[i], {emissive: cols[i], emissiveIntensity: .3})), 0xffffff);
+    bx.position.set(ux * 3.6, uy * 3.6, 0); w.add(bx); boxes.push(bx);
+    const lb = label(nm, cols[i]); lb.position.set(ux * 3.6, uy * 3.6 + 1, 0); w.add(lb);
+    g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(ux * 3.6, uy * 3.6, 0)]), new THREE.LineBasicMaterial({color: cols[i], transparent: true, opacity: .4})));
+    units.push([ux, uy]);
+  });
+  const pk = [];
+  for(let i = 0; i < 12; i++){
+    const s = mesh(new THREE.SphereGeometry(.1, 8, 8), new THREE.MeshBasicMaterial({color: cols[i % 6]}));
+    g.add(s); pk.push({s, m: i % 6, t: Math.random()});
+  }
+  return {g, parts, rot: [.3, 0, 0], sc: 1,
+    tick(dt, th, t, ex){
+      core.rotation.y += dt * (.5 + th * 3); core.rotation.x += dt * .3;
+      ring.rotation.z += dt * .3;
+      boxes.forEach(b => { b.rotation.y += th * 2 * dt; b.rotation.x += dt * .3; });
+      const dist = 3.6 + ex * 2.4;
+      pk.forEach(o => {
+        o.t = (o.t + dt * (.15 + th * 1.2)) % 1;
+        const f = o.t < .5 ? o.t * 2 : 2 - o.t * 2;
+        o.s.position.set(units[o.m][0] * dist * f, units[o.m][1] * dist * f, 0);
+      });
+    },
+    info: th => 'FPS ' + Math.round(20 + th * 100) + '  |  FRAME ' + (1000 / (20 + th * 100)).toFixed(1) + ' ms  |  6 SUBSYSTEMS'};
+}
+
+// ---------- modes + UI ----------
+const MODES = [['🚗 Car', car], ['✈️ Jet', jet], ['🚀 Rocket', rocket], ['🎮 Game', game]];
+const root = new THREE.Group(); scene.add(root);
+let cur = null;
+const btns = MODES.map((m, i) => {
+  const b = document.createElement('button'); b.textContent = m[0]; b.onclick = () => setMode(i); $('bar').appendChild(b); return b;
+});
+function setMode(i){
+  if(cur) root.remove(cur.g);
+  cur = MODES[i][1](); root.add(cur.g);
+  root.rotation.set(cur.rot[0], cur.rot[1], cur.rot[2]); root.scale.setScalar(cur.sc);
+  btns.forEach((b, k) => b.classList.toggle('on', k === i));
+}
+setMode(0);
+
+// ---------- hands ----------
+const d2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function gesture(l){
+  const w = l[0], hs = d2(w, l[9]);
+  if(d2(l[4], l[8]) < hs * 0.35) return 'pinch';
+  const e = [[8,6],[12,10],[16,14],[20,18]].map(p => d2(l[p[0]], w) > d2(l[p[1]], w) * 1.1);
+  const n = e.filter(Boolean).length;
+  if(n === 0) return 'fist';
+  if(n === 4) return 'palm';
+  if(e[0] && e[1] && !e[2] && !e[3]) return 'peace';
+  return 'other';
+}
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function skel(P){
+  ox.lineCap = 'round'; ox.beginPath();
+  BONES.forEach(b => { ox.moveTo(P[b[0]][0], P[b[0]][1]); ox.lineTo(P[b[1]][0], P[b[1]][1]); });
+  ox.strokeStyle = 'rgba(0,255,255,.3)'; ox.lineWidth = 9; ox.stroke();
+  ox.strokeStyle = '#0ff'; ox.lineWidth = 3; ox.stroke();
+  P.forEach((q, k) => { ox.beginPath(); ox.arc(q[0], q[1], k % 4 === 0 && k > 0 ? 6 : 3.5, 0, 7); ox.fillStyle = k % 4 === 0 && k > 0 ? '#fff' : '#0ff'; ox.fill(); });
+}
+
+let hl = null, th = .1, thT = .1, ex = 0, exT = 0, last = performance.now();
+const prev = [null, null];
+
+function loop(){
+  try{
+    const now = performance.now(), dt = Math.min(.05, (now - last) / 1000); last = now;
+    const vw = v.videoWidth, vh = v.videoHeight, s = Math.max(W / vw, H / vh);
+    const cw = W / s, ch = H / s, ox0 = (vw - cw) / 2, oy0 = (vh - ch) / 2;
+    const toS = p => [W - ((p.x * vw - ox0) / cw * W), (p.y * vh - oy0) / ch * H];
+    ox.clearRect(0, 0, W, H);
+
+    const hands = hl.detectForVideo(v, now).landmarks;
+    const pin = [null, null];
+    let palm = false, fist = false, peace = false;
+    hands.forEach((l, i) => {
+      if(i > 1) return;
+      const P = l.map(toS), g = gesture(l);
+      skel(P);
+      if(g === 'pinch'){
+        pin[i] = [(P[4][0] + P[8][0]) / 2, (P[4][1] + P[8][1]) / 2];
+        ox.strokeStyle = '#ff0'; ox.lineWidth = 4; ox.beginPath(); ox.arc(pin[i][0], pin[i][1], 24, 0, 7); ox.stroke();
+      }
+      if(g === 'palm') palm = true;
+      if(g === 'fist') fist = true;
+      if(g === 'peace') peace = true;
+    });
+    const np = (pin[0] ? 1 : 0) + (pin[1] ? 1 : 0);
+    if(np === 1){
+      const i = pin[0] ? 0 : 1;
+      if(prev[i]){ root.rotation.y += (pin[i][0] - prev[i][0]) * .012; root.rotation.x += (pin[i][1] - prev[i][1]) * .012; }
+    } else if(np === 2){
+      const dist = Math.hypot(pin[0][0] - pin[1][0], pin[0][1] - pin[1][1]);
+      exT = Math.max(0, Math.min(1, (dist / W - .08) / .45));
+    }
+    prev[0] = pin[0]; prev[1] = pin[1];
+    if(np === 0){
+      if(palm) thT = 1; else if(fist) thT = .1;
+      if(peace) exT = 0;
+      root.rotation.y += dt * .12;
+    }
+
+    th += (thT - th) * Math.min(1, dt * 3);
+    ex += (exT - ex) * Math.min(1, dt * 6);
+    cur.parts.forEach(p => p.position.copy(p.userData.dir).multiplyScalar(ex * 2));
+    cur.tick(dt, th, now / 1000, ex);
+    renderer.render(scene, cam);
+
+    const k = Math.round(th * 20);
+    infoEl.textContent = cur.info(th) + '  |  EXPLODE ' + Math.round(ex * 100) + '%\nTHROTTLE ' + '█'.repeat(k) + '░'.repeat(20 - k);
+  } catch(e){
+    infoEl.textContent = 'Error: ' + e.message; return;
+  }
+  requestAnimationFrame(loop);
+}
+
+async function main(){
+  try{
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const mk = async f => { try{ return await f("GPU"); } catch(e){ return await f("CPU"); } };
+    hl = await mk(dlg => HandLandmarker.createFromOptions(fs, {
+      baseOptions: {modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: dlg},
+      runningMode: "VIDEO", numHands: 2}));
+    v.srcObject = await navigator.mediaDevices.getUserMedia({video: {facingMode: "user"}});
+    await v.play();
+    requestAnimationFrame(loop);
+  } catch(e){
+    infoEl.textContent = 'Error: ' + e.message;
+  }
+}
+main();
+</script>
+</body>
+</html>
